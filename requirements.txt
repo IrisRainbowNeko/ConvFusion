@@ -1,0 +1,7 @@
+--find-links https://download.pytorch.org/whl/torch_stable.html
+torch>=2.5
+rainbowneko
+hcpdiff
+wandb
+sentencepiece
+triton>=2.0.0

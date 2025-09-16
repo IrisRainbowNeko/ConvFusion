@@ -1,0 +1,139 @@
+_base_:
+  - cfgs/train/yaml/dataset/base_dataset.yaml
+  - cfgs/train/yaml/train_base.yaml
+  - cfgs/train/yaml/tuning_base.yaml
+
+exp_dir: exps/sdxl-conv-v4-lr3e-4
+mixed_precision: 'fp16'
+
+model_part:
+  _target_: rainbowneko.parser.CfgModelParser
+  cfg_model:
+    - lr: 3e-4
+      layers:
+        - 're:^denoiser\..*transformer_blocks.*\.conv1$'
+
+model_plugin: null
+emb_pt: null # For prompt-tuning
+
+train:
+  w_pred: 1.0
+  w_feat: 0.001
+  train_steps: 200000
+  gradient_accumulation_steps: 2
+  save_step: 2000
+  scale_lr: False
+
+  # resume:
+  #   _target_: rainbowneko.ckpt_manager.NekoResumer
+  #   start_step: 6000
+  #   loader:
+  #     model:
+  #       _target_: rainbowneko.ckpt_manager.NekoModelLoader
+  #       path: exps/sdxl-conv-v4-lr3e-4/ckpts/model-xxxx.safetensors
+  #       target_module: denoiser
+
+  loss:
+    _target_: torch.nn.MSELoss
+    reduction: 'none'
+
+  # optimizer:
+  #   _target_: bitsandbytes.optim.Adam8bit
+  #   _partial_: True
+  #   weight_decay: 0.03
+  #   betas: [0.9, 0.99]
+  metrics: null
+
+  optimizer:
+    _target_: torch.optim.AdamW
+    _partial_: True
+    weight_decay: 0.03
+    betas: [0.9, 0.99]
+
+  lr_scheduler:
+    name: constant_with_warmup
+    num_warmup_steps: 500
+    num_training_steps: ${train.train_steps}
+
+model:
+  pretrained_model_name_or_path: '/mnt/data1/pretrained_models/stable-diffusion-xl-base-1.0'
+
+  wrapper:
+    _target_: models.SDXLDistWrapper.from_pretrained
+    _partial_: True
+    models:
+      denoiser_T:
+        _target_: diffusers.UNet2DConditionModel.from_pretrained
+        pretrained_model_name_or_path: ${model.pretrained_model_name_or_path}
+        subfolder: unet
+        low_cpu_mem_usage: false
+      denoiser:
+        _target_: models.SDXLConvModel.from_pretrained
+        pretrained_model_name_or_path: ${model.pretrained_model_name_or_path}
+        subfolder: unet
+        low_cpu_mem_usage: false
+      TE:
+        _target_: hcpdiff.models.compose.SDXLTextEncoder.from_pretrained
+        pretrained_model_name_or_path: ${model.pretrained_model_name_or_path}
+      vae:
+        _target_: diffusers.AutoencoderKL.from_pretrained
+        pretrained_model_name_or_path: /mnt/data1/pretrained_models/sdxl-vae-fp16-fix
+      noise_sampler:
+        _target_: hcpdiff.diffusion.sampler.VPSampler
+        sigma_scheduler:
+          _target_: hcpdiff.diffusion.sampler.DDPMDiscreteSigmaScheduler
+          linear_start: 0.00085
+          linear_end: 0.0120
+          beta_schedule: 'scaled_linear'
+      tokenizer:
+        _target_: hcpdiff.models.compose.SDXLTokenizer.from_pretrained
+        pretrained_model_name_or_path: ${model.pretrained_model_name_or_path}
+
+logger:
+  -
+    _target_: rainbowneko.loggers.CLILogger
+    _partial_: True
+    out_path: 'train.log'
+    log_step: 20
+
+ckpt_saver:
+  model:
+    _target_: rainbowneko.ckpt_manager.ckpt_saver
+    layers: rainbowneko.ckpt_manager.LAYERS_TRAINABLE
+    target_module: denoiser
+
+evaluator:
+  _target_: hcpdiff.evaluate.HCPPreviewer
+  _partial_: True
+  interval: 2000
+  workflow: cfgs/workflow/sdxl_conv.py
+
+data_root: /mnt/data_center/data2/dataset/mjv5
+
+data_train:
+  dataset1:
+    _target_: hcpdiff.data.TextImagePairDataset
+
+    source:
+      data_source1:
+        _target_: data.source.lmdb_text2img.LmdbText2ImageSource
+        img_root: '${data_root}/mjv5.lmdb'
+        label_file: '${data_root}/image_captions_prune.json'
+        prompt_template: 'prompt_tuning_template/caption.txt'
+
+    handler: 
+      _target_: hcpdiff.data.StableDiffusionHandler
+      erase: 0.15
+      bucket: 
+        _target_: rainbowneko.data.RatioBucket
+        
+    bucket:
+      _target_: rainbowneko.data.RatioBucket.from_files
+      target_area: 1048576 # 1024 * 1024
+      step_size: 16
+      num_bucket: 6
+      pre_build_bucket: ${data_root}/mjv5-bucket-s1024-bs8-gpu4-step16.pkl
+
+    batch_size: 4
+    cache_latents: False
+    encoder_attention_mask: true
