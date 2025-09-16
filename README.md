@@ -64,11 +64,11 @@ y = DepthwiseConv2DFunction.apply(x, w, stride=1, padding=4, dilation=1)
 
 Our project is build with HCP-Diffusion and the model inference using HCP-Diffusion workflow:
 ```bash
-CUDA_VISIBLE_DEVICES=0 hcp_run --cfg cfgs/workflow/sd1_5_conv.py CKPT_PATH="path_to_model_ckpt"
+CUDA_VISIBLE_DEVICES=0 hcp_run --cfg cfgs/workflow/conv/sd1_5_conv.py CKPT_PATH="path_to_model_ckpt"
 ```
-where `cfgs/workflow/sd1_5_conv.py` is the text-to-image workflow config file of $\Delta$-ConvFusion with SD1.5 structure.
+where `cfgs/workflow/conv/sd1_5_conv.py` is the text-to-image workflow config file of $\Delta$-ConvFusion with SD1.5 structure.
 
-For more models please refer to `infer.sh` and config files.
+For more models please refer to `infer.sh` and config files in `cfgs/workflow/conv/`.
 
 ### With diffusers
 
