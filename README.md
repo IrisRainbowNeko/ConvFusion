@@ -2,6 +2,14 @@
 
 Official PyTorch Implementation of "Can We Achieve Efficient Diffusion without Self-Attention? Distilling Self-Attention into Convolutions"
 
+![](imgs/exp_sd15.jpg)
+![](imgs/exp_sdxl.jpg)
+![](imgs/exp_pixart.jpg)
+
+$\Delta$-ConvBlock for diffusion models.
+![](imgs/method.jpg)
+
+
 ## Prepare and Installation
 
 Clone the repo:
