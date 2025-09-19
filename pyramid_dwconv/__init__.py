@@ -1,2 +1,4 @@
 from .conv_block import PyramidConvBlockTriton
 from .dwconv_triton import OptimizedDepthwiseConv2d, DepthwiseConv2DFunction
+from .avgpool_triton import OptimizedAdaptiveAvgPool2d, AdaptiveAvgPool2dFunction
+from .up_triton import OptimizedBilinearInterp2d, BilinearInterp2dFunction
