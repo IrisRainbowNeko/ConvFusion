@@ -3,7 +3,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from pyramid_dwconv.dwconv_triton import OptimizedDepthwiseConv2d
-from pyramid_dwconv.up_triton import OptimizedBilinearInterp2d
+from pyramid_dwconv.up_triton import BilinearInterp2dFunction
 from pyramid_dwconv.avgpool_triton import OptimizedAdaptiveAvgPool2d
 
 class SimpleGateTriton(nn.Module):
@@ -18,8 +18,8 @@ class SimpleGateTriton(nn.Module):
     def forward(self, x):
         B, H, W, C = x.shape
         if self.scale_factor != 1.:
-            x = F.adaptive_avg_pool2d(x.permute(0, 3, 1, 2), (int(H*self.scale_factor), int(W*self.scale_factor))).permute(0, 2, 3, 1)
-            # x = OptimizedAdaptiveAvgPool2d((int(H*self.scale_factor), int(W*self.scale_factor)))(x)
+            # x = F.adaptive_avg_pool2d(x.permute(0, 3, 1, 2), (int(H*self.scale_factor), int(W*self.scale_factor))).permute(0, 2, 3, 1)
+            x = OptimizedAdaptiveAvgPool2d((int(H*self.scale_factor), int(W*self.scale_factor)))(x)
         x = self.conv_spatial(x)
         x1, x2 = x.chunk(2, dim=-1)
         if self.simple:
@@ -27,8 +27,8 @@ class SimpleGateTriton(nn.Module):
         else:
             x = x1 * torch.sigmoid(x2) # PixArt used old setting
         if self.scale_factor != 1.:
-            x = F.interpolate(x.permute(0, 3, 1, 2), size=(H,W), mode='bilinear', align_corners=False).permute(0, 2, 3, 1)
-            # x = OptimizedBilinearInterp2d((H,W))(x)
+            # x = F.interpolate(x.permute(0, 3, 1, 2), size=(H,W), mode='bilinear', align_corners=False).permute(0, 2, 3, 1)
+            x = BilinearInterp2dFunction.apply(x, (H,W), align_corners=False)
         return x
 
 

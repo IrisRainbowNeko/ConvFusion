@@ -1,340 +1,354 @@
 import torch
 import triton
 import triton.language as tl
+from torch.amp import custom_fwd, custom_bwd
+
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_H': 32, 'BLOCK_W': 32, 'BLOCK_C': 32}, num_warps=8),
-        triton.Config({'BLOCK_H': 16, 'BLOCK_W': 16, 'BLOCK_C': 64}, num_warps=4),
-        triton.Config({'BLOCK_H': 8, 'BLOCK_W': 8, 'BLOCK_C': 128}, num_warps=8),
+        triton.Config({'BLOCK_C': 32, 'BLOCK_N': 128}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_C': 64, 'BLOCK_N': 128}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_C': 64, 'BLOCK_N': 256}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_C': 128, 'BLOCK_N': 128}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_C': 128, 'BLOCK_N': 256}, num_warps=8, num_stages=2),
     ],
     key=['batch', 'in_h', 'in_w', 'channels', 'out_h', 'out_w'],
 )
 @triton.jit
-def _adaptive_avg_pool_kernel(
-    input_ptr, output_ptr,
-    batch, in_h, in_w, channels,
-    out_h, out_w,
-    BLOCK_H: tl.constexpr, BLOCK_W: tl.constexpr, BLOCK_C: tl.constexpr,
+def _adaptive_avg_pool_kernel_optimized(
+        input_ptr, output_ptr,
+        batch, in_h, in_w, channels,
+        out_h, out_w,
+        DTYPE: tl.constexpr,
+        BLOCK_C: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
-    # 3D parallelization
-    pid_h = tl.program_id(0)
-    pid_w = tl.program_id(1)
-    pid_bc = tl.program_id(2)
-    
-    # Decompose combined dimensions
-    num_channel_blocks = tl.cdiv(channels, BLOCK_C)
-    pid_batch = pid_bc // num_channel_blocks
-    pid_c = pid_bc % num_channel_blocks
-    
-    if pid_batch >= batch or pid_c * BLOCK_C >= channels:
-        return
-    
-    # Channel mask
-    c_start = pid_c * BLOCK_C
-    c_mask = (tl.arange(0, BLOCK_C) < channels - c_start)
-    
-    # Spatial position calculation (using larger blocks for medium-sized spatial dimensions)
-    h_idx = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)  # (BLOCK_H)
-    w_idx = pid_w * BLOCK_W + tl.arange(0, BLOCK_W)  # (BLOCK_W)
-    
-    # Dynamic window parameters
-    h_start = tl.floor((h_idx.to(tl.float16) * in_h) / out_h).to(tl.int32)
-    h_end = tl.ceil(((h_idx + 1).to(tl.float16) * (in_h)) / out_h).to(tl.int32)
-    h_num = h_end-h_start
-    w_start = tl.floor(((w_idx).to(tl.float16) * (in_w)) / out_w).to(tl.int32)
-    w_end = tl.ceil(((w_idx + 1).to(tl.float16) * (in_w)) / out_w).to(tl.int32)
-    w_num = w_end-w_start
+    # 2D grid: pid0 covers (c-group, n-tile), pid1 is batch
+    pid0 = tl.program_id(0)
+    pid_b = tl.program_id(1)
 
-    # Input feature map starting position
-    batch_offset = pid_batch * in_h * in_w * channels
-    
-    # Initialize accumulators
-    sum_acc = tl.zeros((BLOCK_H, BLOCK_W, BLOCK_C), dtype=tl.float32)
-    count_acc = tl.zeros((BLOCK_H, BLOCK_W), dtype=tl.int32)
-    
-    # Sliding window traversal
-    for kh in range(tl.max(h_num)):
-        for kw in range(tl.max(w_num)):
-            # Calculate input coordinates (maintain 2D shape)
-            current_h = h_start + kh  # (BLOCK_H)
-            current_w = w_start + kw  # (BLOCK_W)
-            
-            # Generate spatial mask (auto-broadcast to BLOCK_H x BLOCK_W)
-            h_mask = (current_h >= 0) & (current_h < h_end)  # (BLOCK_H)
-            w_mask = (current_w >= 0) & (current_w < w_end)  # (BLOCK_W)
-            valid_mask = h_mask[:, None] & w_mask[None, :]  # (BLOCK_H, BLOCK_W)
-            
-            # Input pointer calculation (explicit broadcast to 3D)
-            input_ptrs = (
-                batch_offset +
-                (current_h[:, None, None] * in_w * channels) +
-                (current_w[None, :, None] * channels) + 
-                (c_start + tl.arange(0, BLOCK_C))[None, None, :]
+    n_tiles = tl.cdiv(out_h * out_w, BLOCK_N)
+    pid_cg = pid0 // n_tiles
+    pid_nt = pid0 % n_tiles
+
+    c_start = pid_cg * BLOCK_C
+    offs_c = c_start + tl.arange(0, BLOCK_C)
+    mask_c = offs_c < channels
+
+    n_start = pid_nt * BLOCK_N
+    offs_n = n_start + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < (out_h * out_w)
+
+    oh = offs_n // out_w
+    ow = offs_n % out_w
+
+    # compute pooling windows per output index (pure integer math)
+    h_start = (oh * in_h) // out_h
+    h_end = ((oh + 1) * in_h + out_h - 1) // out_h
+    w_start = (ow * in_w) // out_w
+    w_end = ((ow + 1) * in_w + out_w - 1) // out_w
+
+    h_len = tl.maximum(h_end - h_start, 0)
+    w_len = tl.maximum(w_end - w_start, 0)
+
+    # compute dtype
+    dtype = tl.float16 if DTYPE == 0 else (tl.bfloat16 if DTYPE == 1 else tl.float32)
+
+    # accumulator over window [BLOCK_N, BLOCK_C]
+    acc = tl.zeros([BLOCK_N, BLOCK_C], dtype=dtype)
+
+    max_kh = tl.max(h_len)
+    max_kw = tl.max(w_len)
+
+    for kh in range(0, max_kh):
+        ih = h_start + kh
+        h_valid = (kh < h_len) & (ih >= 0) & (ih < in_h) & mask_n
+        for kw in range(0, max_kw):
+            iw = w_start + kw
+            w_valid = (kw < w_len) & (iw >= 0) & (iw < in_w) & mask_n
+            valid = h_valid & w_valid
+
+            x_base = (
+                    pid_b * (in_h * in_w * channels)
+                    + ih * (in_w * channels)
+                    + iw * channels
             )
-            
-            # Vectorized load with mask
-            data = tl.load(
-                input_ptr + input_ptrs,
-                mask=valid_mask[:, :, None] & c_mask[None, None, :],
-                other=0.0
-            )
-            
-            # Accumulate sum and count
-            sum_acc += data
-            count_acc += valid_mask  # Direct use of 2D mask
-    
-    # Calculate average
-    safe_count = tl.maximum(count_acc, 1).to(tl.float32)[:, :, None]
-    avg_result = sum_acc / safe_count
-    
-    # Output pointer calculation
-    output_ptrs = (
-        pid_batch * out_h * out_w * channels +
-        (h_idx[:, None, None] * out_w * channels) +
-        (w_idx[None, :, None] * channels) + 
-        (c_start + tl.arange(0, BLOCK_C))[None, None, :]
+            x_ptrs = input_ptr + x_base[:, None] + offs_c[None, :]
+            m = valid[:, None] & mask_c[None, :]
+            x = tl.load(x_ptrs, mask=m, other=0.0).to(dtype)
+            acc += x
+
+    area = tl.maximum(h_len * w_len, 1).to(dtype)[:, None]
+    out_val = (acc / area).to(dtype)
+
+    y_base = (
+            pid_b * (out_h * out_w * channels)
+            + oh * (out_w * channels)
+            + ow * channels
     )
-    
-    # Generate output mask
-    output_mask = (
-        (h_idx[:, None, None] < out_h) & 
-        (w_idx[None, :, None] < out_w) & 
-        c_mask[None, None, :]
-    )
-    
-    # Result storage
-    tl.store(output_ptr + output_ptrs, avg_result, mask=output_mask)
+    y_ptrs = output_ptr + y_base[:, None] + offs_c[None, :]
+    tl.store(y_ptrs, out_val, mask=(mask_n[:, None] & mask_c[None, :]))
+
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_H': 32, 'BLOCK_W': 32, 'BLOCK_C': 32}, num_warps=8),
-        triton.Config({'BLOCK_H': 16, 'BLOCK_W': 16, 'BLOCK_C': 64}, num_warps=4),
-        triton.Config({'BLOCK_H': 8, 'BLOCK_W': 8, 'BLOCK_C': 128}, num_warps=8),
+        triton.Config({'BLOCK_C': 32, 'BLOCK_N': 128}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_C': 64, 'BLOCK_N': 128}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_C': 64, 'BLOCK_N': 256}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_C': 128, 'BLOCK_N': 128}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_C': 128, 'BLOCK_N': 256}, num_warps=8, num_stages=2),
     ],
     key=['batch', 'in_h', 'in_w', 'channels', 'out_h', 'out_w'],
 )
 @triton.jit
-def _adaptive_avg_pool_grad_kernel(
-    grad_output_ptr, grad_input_ptr,
-    batch, in_h, in_w, channels,
-    out_h, out_w,
-    BLOCK_H: tl.constexpr, BLOCK_W: tl.constexpr, BLOCK_C: tl.constexpr,
+def _adaptive_avg_pool_backward_input_kernel(
+        grad_output_ptr, grad_input_ptr,
+        batch, in_h, in_w, channels,
+        out_h, out_w,
+        DTYPE: tl.constexpr,
+        BLOCK_C: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
-    # 3D parallelization: each program handles a block of output space and batch-channel block
-    pid_h = tl.program_id(0)
-    pid_w = tl.program_id(1)
-    pid_bc = tl.program_id(2)
-    
-    num_channel_blocks = tl.cdiv(channels, BLOCK_C)
-    pid_batch = pid_bc // num_channel_blocks
-    pid_c = pid_bc % num_channel_blocks
-    
-    if pid_batch >= batch or pid_c * BLOCK_C >= channels:
-        return
-    
-    c_start = pid_c * BLOCK_C
-    c_mask = (tl.arange(0, BLOCK_C) < channels - c_start)
-    
-    # Output h and w indices
-    oh = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
-    ow = pid_w * BLOCK_W + tl.arange(0, BLOCK_W)
-    
-    # Calculate input window parameters (consistent with forward process)
-    h_start = tl.floor((oh.to(tl.float16) * in_h) / out_h).to(tl.int32)
-    h_end = tl.ceil(((oh + 1).to(tl.float16) * in_h) / out_h).to(tl.int32)
-    h_num = h_end - h_start
-    
-    w_start = tl.floor((ow.to(tl.float16) * in_w) / out_w).to(tl.int32)
-    w_end = tl.ceil(((ow + 1).to(tl.float16) * in_w) / out_w).to(tl.int32)
-    w_num = w_end - w_start
-    
-    # Load gradient values of current output block
-    output_ptrs = (
-        pid_batch * out_h * out_w * channels +
-        oh[:, None, None] * out_w * channels +
-        ow[None, :, None] * channels +
-        (c_start + tl.arange(0, BLOCK_C))[None, None, :]
-    )
-    output_mask = (
-        (oh[:, None, None] < out_h) &
-        (ow[None, :, None] < out_w) &
-        c_mask[None, None, :]
-    )
-    grad_output = tl.load(grad_output_ptr + output_ptrs, mask=output_mask, other=0.0)
-    
-    # Calculate effective area and normalize
-    area = (h_num[:, None] * w_num[None, :]).to(tl.float32)
-    area = tl.maximum(area, 1.0)
-    grad_val = grad_output / area[:, :, None]  # Broadcast to channel dimension
-    
-    # Traverse all positions in input window
-    max_h_steps = tl.max(h_num)
-    max_w_steps = tl.max(w_num)
-    
-    for kh in range(max_h_steps):
-        for kw in range(max_w_steps):
-            # Calculate current input position
-            current_h = h_start + kh
-            current_w = w_start + kw
-            
-            # Generate valid mask
-            h_valid = (kh < h_num) & (current_h < in_h)
-            w_valid = (kw < w_num) & (current_w < in_w)
-            valid_mask = h_valid[:, None] & w_valid[None, :]
-            
-            # Calculate input pointer
-            input_ptrs = (
-                pid_batch * in_h * in_w * channels +
-                current_h[:, None, None] * in_w * channels +
-                current_w[None, :, None] * channels +
-                (c_start + tl.arange(0, BLOCK_C))[None, None, :]
+    # 2D grid: pid0 covers (c-group, n_in-tile), pid1 is batch
+    pid0 = tl.program_id(0)
+    pid_b = tl.program_id(1)
+
+    n_tiles = tl.cdiv(in_h * in_w, BLOCK_N)
+    pid_cg = pid0 // n_tiles
+    pid_nt = pid0 % n_tiles
+
+    c_start = pid_cg * BLOCK_C
+    offs_c = c_start + tl.arange(0, BLOCK_C)
+    mask_c = offs_c < channels
+
+    n_start = pid_nt * BLOCK_N
+    offs_n = n_start + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < (in_h * in_w)
+
+    ih = offs_n // in_w
+    iw = offs_n % in_w
+
+    # Overlapped contributions: for each input (ih, iw), accumulate all output bins including it
+    ih0 = ih
+    iw0 = iw
+
+    oh_start = (ih0 * out_h) // in_h
+    oh_end = ((ih0 + 1) * out_h + in_h - 1) // in_h
+    ow_start = (iw0 * out_w) // in_w
+    ow_end = ((iw0 + 1) * out_w + in_w - 1) // in_w
+
+    oh_len = tl.maximum(oh_end - oh_start, 0)
+    ow_len = tl.maximum(ow_end - ow_start, 0)
+
+    dtype = tl.float16 if DTYPE == 0 else (tl.bfloat16 if DTYPE == 1 else tl.float32)
+    acc = tl.zeros([BLOCK_N, BLOCK_C], dtype=dtype)
+
+    max_oh = tl.max(oh_len)
+    max_ow = tl.max(ow_len)
+
+    for dho in range(0, max_oh):
+        oh = oh_start + dho
+        oh_valid = (dho < oh_len) & (oh >= 0) & (oh < out_h) & mask_n
+        # window extents for this oh
+        h_s = (oh * in_h) // out_h
+        h_e = ((oh + 1) * in_h + out_h - 1) // out_h
+        h_ws = tl.maximum(h_e - h_s, 1).to(tl.float32)
+        h_mem = (ih0 >= h_s) & (ih0 < h_e)
+
+        for dwo in range(0, max_ow):
+            ow = ow_start + dwo
+            ow_valid = (dwo < ow_len) & (ow >= 0) & (ow < out_w) & mask_n
+            w_s = (ow * in_w) // out_w
+            w_e = ((ow + 1) * in_w + out_w - 1) // out_w
+            w_ws = tl.maximum(w_e - w_s, 1).to(tl.float32)
+            w_mem = (iw0 >= w_s) & (iw0 < w_e)
+
+            valid = oh_valid & ow_valid & h_mem & w_mem
+
+            area = (h_ws * w_ws).to(dtype)[:, None]
+            go_base = (
+                    pid_b * (out_h * out_w * channels)
+                    + oh * (out_w * channels)
+                    + ow * channels
             )
-            
-            # Combine complete mask
-            final_mask = (
-                valid_mask[:, :, None] & 
-                (current_h[:, None, None] >= 0) &
-                (current_w[None, :, None] >= 0) &
-                c_mask[None, None, :]
-            )
-            
-            # Use atomic add operation to accumulate gradients
-            tl.atomic_add(grad_input_ptr + input_ptrs, grad_val, mask=final_mask)
+            go_ptrs = grad_output_ptr + go_base[:, None] + offs_c[None, :]
+            m = valid[:, None] & mask_c[None, :]
+            go = tl.load(go_ptrs, mask=m, other=0.0).to(dtype)
+            acc += (go / area).to(dtype)
+
+    # write gradients back (no atomics)
+    x_base = (
+            pid_b * (in_h * in_w * channels)
+            + ih * (in_w * channels)
+            + iw * channels
+    )
+    x_ptrs = grad_input_ptr + x_base[:, None] + offs_c[None, :]
+    tl.store(x_ptrs, acc, mask=(mask_n[:, None] & mask_c[None, :]))
+
 
 class AdaptiveAvgPool2dFunction(torch.autograd.Function):
     @staticmethod
+    @custom_fwd(device_type="cuda")
     def forward(ctx, input, output_size):
         batch, in_h, in_w, channels = input.shape
         ctx.output_size = output_size
 
         out_h, out_w = output_size
-        
+
+        amp_enabled = torch.is_autocast_enabled()
+        compute_dtype = torch.get_autocast_dtype('cuda') if amp_enabled else input.dtype
+        x = input if input.dtype == compute_dtype else input.to(compute_dtype)
+
         # Output tensor initialization
-        output = torch.empty((batch, out_h, out_w, channels), device=input.device, dtype=input.dtype)
-        
-        # Dynamic grid division
+        output = torch.empty((batch, out_h, out_w, channels), device=input.device, dtype=compute_dtype)
+
+        # Grid: (c-group * n-tiles (out)), batch)
         def grid(meta):
+            n_tiles = triton.cdiv(out_h * out_w, meta['BLOCK_N'])
             return (
-                triton.cdiv(out_h, meta['BLOCK_H']),
-                triton.cdiv(out_w, meta['BLOCK_W']),
-                batch * triton.cdiv(channels, meta['BLOCK_C'])
+                n_tiles * triton.cdiv(channels, meta['BLOCK_C']),
+                batch,
             )
-        
+
+        # DTYPE flag: 0=fp16,1=bf16,2=fp32
+        dtype_flag = 2
+        if compute_dtype == torch.float16:
+            dtype_flag = 0
+        elif compute_dtype == torch.bfloat16:
+            dtype_flag = 1
+
         # Launch optimized kernel
-        _adaptive_avg_pool_kernel[grid](
-            input, output,
+        _adaptive_avg_pool_kernel_optimized[grid](
+            x, output,
             batch, in_h, in_w, channels,
             out_h, out_w,
+            DTYPE=dtype_flag,
         )
-        ctx.save_for_backward(input)
+        ctx.save_for_backward(x)
+        ctx.compute_dtype = compute_dtype
         return output
 
     @staticmethod
+    @custom_bwd(device_type="cuda")
     def backward(ctx, grad_output):
         input = ctx.saved_tensors[0]
         out_h, out_w = ctx.output_size
 
         batch, in_h, in_w, channels = input.shape
-        
-        # Initialize gradients
-        grad_input = torch.zeros_like(input)
-        
-        # Calculate input gradients
+        compute_dtype = getattr(ctx, 'compute_dtype', grad_output.dtype)
+        go = grad_output if grad_output.dtype == compute_dtype else grad_output.to(compute_dtype)
+
+        # Initialize gradients (write in input dtype)
+        grad_input = torch.zeros((batch, in_h, in_w, channels), device=input.device, dtype=input.dtype)
+
+        # Grid: (c-group * n_in-tiles, batch)
         def grid(meta):
+            n_tiles = triton.cdiv(in_h * in_w, meta['BLOCK_N'])
             return (
-                triton.cdiv(out_h, meta['BLOCK_H']),
-                triton.cdiv(out_w, meta['BLOCK_W']),
-                batch * triton.cdiv(channels, meta['BLOCK_C'])
+                n_tiles * triton.cdiv(channels, meta['BLOCK_C']),
+                batch,
             )
-        
-        _adaptive_avg_pool_grad_kernel[grid](
-            grad_output, grad_input,
+
+        dtype_flag = 2
+        if compute_dtype == torch.float16:
+            dtype_flag = 0
+        elif compute_dtype == torch.bfloat16:
+            dtype_flag = 1
+
+        _adaptive_avg_pool_backward_input_kernel[grid](
+            go, grad_input,
             batch, in_h, in_w, channels,
             out_h, out_w,
+            DTYPE=dtype_flag,
         )
-        
+
         return grad_input, None
+
 
 class OptimizedAdaptiveAvgPool2d(torch.nn.Module):
     def __init__(self, output_size):
         super().__init__()
         self.output_size = (output_size, output_size) if isinstance(output_size, int) else output_size
-        
+
     def forward(self, x):
         # Input validation
         assert x.dim() == 4, "Input must be a 4D tensor in BHWC format"
-        
+
         return AdaptiveAvgPool2dFunction.apply(x, self.output_size)
 
 
 # Performance testing
 def benchmark(batch_size=8, height=224, width=224, channels=64, scale=0.5, dtype=torch.float16):
     import time
-    
+
     # Create input
     x = torch.randn(batch_size, height, width, channels, dtype=dtype).cuda()
-    
+
     # Create our implementation
     conv_triton = OptimizedAdaptiveAvgPool2d(
-        (int(height*scale), int(width*scale))
+        (int(height * scale), int(width * scale))
     ).cuda()
 
-    out_triton = conv_triton(x)
+    with torch.cuda.amp.autocast(dtype=dtype):
+        out_triton = conv_triton(x)
     grad = torch.randn_like(out_triton)
-    
+
     # Create PyTorch implementation (need to convert to BCHW format)
     x_torch = x.permute(0, 3, 1, 2)  # BHWC -> BCHW
     grad_torch = grad.permute(0, 3, 1, 2)
     conv_torch = torch.nn.AdaptiveAvgPool2d(
-        (int(height*scale), int(width*scale))
+        (int(height * scale), int(width * scale))
     ).cuda().to(dtype)
 
     x.requires_grad = True
     x_torch.requires_grad = True
-    
+
     # Warmup
     for _ in range(10):
-        y1 = conv_triton(x)
-        y2 = conv_torch(x_torch)
-        torch.autograd.backward(y1, grad)
-        torch.autograd.backward(y2, grad_torch)
-    
+        with torch.cuda.amp.autocast(dtype=dtype):
+            y1 = conv_triton(x)
+            y2 = conv_torch(x_torch)
+            torch.autograd.backward(y1, grad)
+            torch.autograd.backward(y2, grad_torch)
+
     torch.cuda.synchronize()
-    
+
     # Test our implementation
     iterations = 100
     start = time.time()
     for _ in range(iterations):
-        #y = conv_triton(x)
-        y = conv_torch(x.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
-        torch.autograd.backward(y, grad)
+        with torch.cuda.amp.autocast(dtype=dtype):
+            y = conv_triton(x)
+            torch.autograd.backward(y, grad)
     torch.cuda.synchronize()
     triton_time = (time.time() - start) / iterations
-    
+
     # Test PyTorch implementation
     start = time.time()
     for _ in range(iterations):
-        y = conv_torch(x_torch)
-        torch.autograd.backward(y, grad_torch)
+        with torch.cuda.amp.autocast(dtype=dtype):
+            y = conv_torch(x_torch)
+            torch.autograd.backward(y, grad_torch)
     torch.cuda.synchronize()
     torch_time = (time.time() - start) / iterations
-    
+
     # Convert results to milliseconds
     triton_ms = triton_time * 1000
     torch_ms = torch_time * 1000
-    
+
     print(f"Batch size={batch_size}, Height={height}, Width={width}, Channels={channels}, Scale={scale}")
     print(f"Triton: {triton_ms:.3f}ms, PyTorch: {torch_ms:.3f}ms")
-    print(f"Speedup: {torch_ms/triton_ms:.2f}x")
-    
+    print(f"Speedup: {torch_ms / triton_ms:.2f}x")
+
     # Verify result correctness
     conv_torch.zero_grad()
     conv_triton.zero_grad()
+    # Clear input grads to avoid accumulation from warmup/bench loops
+    x.grad = None
+    x_torch.grad = None
 
-    out_triton = conv_triton(x)
-    out_torch = conv_torch(x_torch).permute(0, 2, 3, 1)  # BCHW -> BHWC
-    
+    with torch.cuda.amp.autocast(dtype=dtype):
+        out_triton = conv_triton(x)
+        out_torch = conv_torch(x_torch).permute(0, 2, 3, 1)  # BCHW -> BHWC
+
     max_diff = torch.max(torch.abs(out_triton - out_torch))
     print(f"Max absolute error: {max_diff.item()}")
 
@@ -343,8 +357,9 @@ def benchmark(batch_size=8, height=224, width=224, channels=64, scale=0.5, dtype
 
     max_diff = torch.max(torch.abs(x.grad - x_torch.grad.permute(0, 2, 3, 1)))
     print(f"Grad max absolute error: {max_diff.item()}")
-    
+
     return triton_ms, torch_ms
+
 
 if __name__ == "__main__":
     # Usage case testing
@@ -352,4 +367,4 @@ if __name__ == "__main__":
     height = 64
     width = 64
     channels = 1152
-    benchmark(batch_size, height, width, channels, scale=1/6)
+    benchmark(batch_size, height, width, channels, scale=1 / 6)
