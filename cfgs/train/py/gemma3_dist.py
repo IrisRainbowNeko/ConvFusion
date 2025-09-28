@@ -27,8 +27,6 @@ from cfgs.workflow.conv import sd1_5_conv
 
 from cfgs.train.py.gemma3_enc import Gemma3Encoder
 
-# DreamShaper的是bin，dreamShaper-8中有safetensors -- 是一个东西吗？
-# hcp_run可以自动找bin，但是hcp_train只能找safetensors
 pretrained_model_name_or_path= 'Lykon/DreamShaper'
 data_root='/data_center/data2/dataset/mjv5'
 
@@ -42,7 +40,6 @@ def make_cfg():
         CKPT_PATH='${exp_dir}/ckpts/model-2000.safetensors',
 
         model_part=CfgWDModelParser(
-            # 选择训练的部分?
             [
                 dict(
                     lr=3e-4,
@@ -109,14 +106,11 @@ def make_cfg():
             name='SD1_5_conv',
             wrapper=StableDiffusionDistWrapper.from_pretrained(
                 _partial_=True,
-                # 模型加载入口
                 models=SD15_dist_auto_loader(
                     _partial_=True,
                     ckpt_path=pretrained_model_name_or_path,
                     
-                    # 更换text_encoder
                     TE=Gemma3Encoder.from_pretrained(
-                            # 加载预训练模型参数
                             pretrained_model_name_or_path='/data_center/data2/gemma-3-4b-it',
                             diffusion_dim=768,
                             with_noise=True,
@@ -145,7 +139,6 @@ def make_cfg():
 
                 source=dict(
                     data_source1=LmdbText2ImageSource(
-                        # 先使用默认配置
                         img_root=os.path.join(data_root, 'mjv5.lmdb'),
                         label_file=os.path.join(data_root, 'image_captions_prune.json'),
                         prompt_template='prompt_tuning_template/caption.txt'
