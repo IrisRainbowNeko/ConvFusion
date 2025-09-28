@@ -25,8 +25,10 @@ from rainbowneko.train.loss import LossGroup, LossContainer
 
 from cfgs.workflow.conv import sd1_5_conv
 
-pretrained_model_name_or_path='Lykon/DreamShaper'
-data_root='data_center/data2/dataset/mjv5'
+from cfgs.train.py.gemma3_enc import Gemma3Encoder
+
+pretrained_model_name_or_path= 'Lykon/DreamShaper'
+data_root='/data_center/data2/dataset/mjv5'
 
 @neko_cfg
 def make_cfg():
@@ -41,8 +43,15 @@ def make_cfg():
             [
                 dict(
                     lr=3e-4,
-                    layers=['re:^denoiser\..*transformer_blocks.*\.conv1$'],
-                )
+                    layers=[r're:^denoiser\..*transformer_blocks.*\.conv1$'],
+                ),
+                
+                dict(
+                    lr=1e-4,
+                    layers=[
+                        r're:^TE(\.text_model)?\.(x0_proj|connector|score_proj|layer_ht)(\.|$)'
+                    ],
+                ),
             ],  
             weight_decay=1e-2,
         ),
@@ -51,6 +60,11 @@ def make_cfg():
             model=ckpt_saver(
                 layers=LAYERS_TRAINABLE,
                 target_module='denoiser',
+            ),
+            
+            te=ckpt_saver(
+                layers=LAYERS_TRAINABLE,
+                target_module='TE',
             )
         ),
 
@@ -92,7 +106,20 @@ def make_cfg():
             name='SD1_5_conv',
             wrapper=StableDiffusionDistWrapper.from_pretrained(
                 _partial_=True,
-                models=SD15_dist_auto_loader(ckpt_path=pretrained_model_name_or_path, _partial_=True),
+                models=SD15_dist_auto_loader(
+                    _partial_=True,
+                    ckpt_path=pretrained_model_name_or_path,
+                    
+                    TE=Gemma3Encoder.from_pretrained(
+                            pretrained_model_name_or_path='/data_center/data2/gemma-3-4b-it',
+                            diffusion_dim=768,
+                            with_noise=True,
+                            ignore_mismatched_sizes=True,
+                            device_map='auto',
+                            offload_folder='offload',
+                            low_cpu_mem_usage=True,
+                        ),
+                ),
             )
         ),
 
@@ -107,7 +134,7 @@ def make_cfg():
         data_train=dict(
             dataset1=TextImagePairDataset(
                 _partial_=True,
-                batch_size=16,
+                batch_size=1,
                 loss_weight=1.0,
 
                 source=dict(
@@ -133,6 +160,6 @@ def make_cfg():
         evaluator=HCPPreviewer(
             _partial_=True,
             interval=2000,
-            workflow=sd1_5_conv.make_cfg(pretrained_model='${model.wrapper.models.ckpt_path}'),
+            workflow=sd1_5_conv.make_cfg(pretrained_model='${model.wrapper.models.ckpt_path}'), 
         )
     )

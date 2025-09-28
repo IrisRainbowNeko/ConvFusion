@@ -8,7 +8,7 @@
 # hcp_train_1gpu --cfg cfgs/train/py/sdxl_dist.py
 
 ## Multi-GPUs
-
-hcp_train --cfg cfgs/train/py/sd1_5_dist.py
+hcp_train --cfg cfgs/train/py/gemma3_dist.py
+# hcp_train --cfg cfgs/train/py/sd1_5_dist.py
 # hcp_train --cfg cfgs/train/py/pixart_dist.py
 # hcp_train --cfg cfgs/train/py/sdxl_dist.py
